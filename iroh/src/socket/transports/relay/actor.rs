@@ -833,6 +833,11 @@ pub(super) enum RelayActorMessage {
     NetworkChange {
         report: Report,
     },
+    /// Restart one active relay so it reloads the current [`RelayMap`] entry.
+    ReconnectRelay {
+        url: RelayUrl,
+        response: oneshot::Sender<()>,
+    },
     /// Trigger an immediate health check on all relay connections.
     ///
     /// Sent after a major network change to detect broken connections faster
@@ -1084,6 +1089,10 @@ impl RelayActor {
             RelayActorMessage::MaybeCloseRelaysOnRebind => {
                 self.maybe_close_relays_on_rebind().await;
             }
+            RelayActorMessage::ReconnectRelay { url, response } => {
+                self.reconnect_relay(url);
+                response.send(()).ok();
+            }
             RelayActorMessage::CheckConnectionAfterNetworkChange => {
                 self.check_connection_after_network_change().await;
             }
@@ -1230,6 +1239,18 @@ impl RelayActor {
         }
     }
 
+    fn reconnect_relay(&mut self, url: RelayUrl) {
+        if let Some(handle) = self.active_relays.remove(&url) {
+            handle.stop_token.cancel();
+        }
+        if self.config.my_relay.get().as_ref().map(RelayStatus::url) == Some(&url) {
+            self.config
+                .my_relay
+                .set(url.clone(), RelayConnectionState::Connecting);
+        }
+        self.active_relay_handle(url);
+    }
+
     fn start_active_relay(&mut self, url: RelayUrl) -> ActiveRelayHandle {
         debug!(?url, "Adding relay connection");
 
@@ -1253,6 +1274,7 @@ impl RelayActor {
         let (prio_inbox_tx, prio_inbox_rx) = mpsc::channel(32);
         let (inbox_tx, inbox_rx) = mpsc::channel(64);
         let span = info_span!("active-relay", %url);
+        let stop_token = self.cancel_token.child_token();
         let opts = ActiveRelayActorOptions {
             url,
             prio_inbox_: prio_inbox_rx,
@@ -1260,7 +1282,7 @@ impl RelayActor {
             relay_datagrams_send: send_datagram_rx,
             relay_datagrams_recv: self.relay_datagram_recv_queue.clone(),
             connection_opts,
-            stop_token: self.cancel_token.child_token(),
+            stop_token: stop_token.clone(),
             metrics: self.config.metrics.clone(),
             my_relay: self.config.my_relay.clone(),
         };
@@ -1275,6 +1297,7 @@ impl RelayActor {
             prio_inbox_addr: prio_inbox_tx,
             inbox_addr: inbox_tx,
             datagrams_send_queue: send_datagram_tx,
+            stop_token,
         };
         self.log_active_relay();
         handle
@@ -1372,6 +1395,7 @@ struct ActiveRelayHandle {
     prio_inbox_addr: mpsc::Sender<ActiveRelayPrioMessage>,
     inbox_addr: mpsc::Sender<ActiveRelayMessage>,
     datagrams_send_queue: mpsc::Sender<RelaySendItem>,
+    stop_token: CancellationToken,
 }
 
 /// A single datagram received from a relay server.

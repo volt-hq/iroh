@@ -678,6 +678,19 @@ impl NetworkChangeSender {
         }
     }
 
+    pub(crate) async fn reconnect_relay(&self, url: &RelayUrl) -> io::Result<()> {
+        if self.relay.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "relay transport is not configured",
+            ));
+        }
+        for relay in &self.relay {
+            relay.reconnect_relay(url.clone()).await?;
+        }
+        Ok(())
+    }
+
     /// Rebinds underlying connections, if necessary.
     pub(crate) fn rebind(&self) -> std::io::Result<()> {
         let mut res = Ok(());

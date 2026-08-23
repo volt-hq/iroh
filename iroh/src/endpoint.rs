@@ -11,7 +11,7 @@
 //!
 //! [module docs]: crate
 
-use std::{collections::BTreeSet, net::SocketAddr, pin::Pin, sync::Arc};
+use std::{collections::BTreeSet, io, net::SocketAddr, pin::Pin, sync::Arc};
 
 #[cfg(not(wasm_browser))]
 use ipnet::{Ipv4Net, Ipv6Net};
@@ -939,6 +939,19 @@ pub enum ConnectError {
     },
 }
 
+#[allow(missing_docs)]
+#[stack_error(derive, add_meta)]
+#[non_exhaustive]
+pub enum ReconnectRelayError {
+    #[error("Endpoint is closed")]
+    EndpointClosed,
+    #[error("Unable to reconnect relay")]
+    Actor {
+        #[error(std_err)]
+        source: io::Error,
+    },
+}
+
 impl Endpoint {
     // The ordering of public methods is reflected directly in the documentation.  This is
     // roughly ordered by what is most commonly needed by users, but grouped in similar
@@ -998,6 +1011,25 @@ impl Endpoint {
             return None;
         }
         self.inner.remove_relay(relay).await
+    }
+
+    /// Replaces a relay configuration and restarts its active connection.
+    ///
+    /// Unlike [`Self::insert_relay`], this operation acknowledges that the relay actor has
+    /// discarded its existing client builder and started a replacement using `config`.
+    /// Connection state remains observable through [`Self::home_relay_status`].
+    pub async fn reconnect_relay(
+        &self,
+        relay: RelayUrl,
+        config: Arc<RelayConfig>,
+    ) -> Result<Option<Arc<RelayConfig>>, ReconnectRelayError> {
+        if self.is_closed() {
+            return Err(e!(ReconnectRelayError::EndpointClosed));
+        }
+        self.inner
+            .reconnect_relay(relay, config)
+            .await
+            .map_err(|source| e!(ReconnectRelayError::Actor, source))
     }
 
     /// Adds an external address on which this endpoint is directly reachable.
@@ -1998,7 +2030,7 @@ mod tests {
         io,
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4},
         str::FromStr,
-        sync::Arc,
+        sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
 
@@ -4049,6 +4081,150 @@ mod tests {
         ep.close().await;
         let res = task.await.unwrap();
         assert!(res.is_err());
+        Ok(())
+    }
+
+    /// Verifies that reconnecting a relay installs a new auth token, preserves
+    /// the endpoint identity, and restores inbound relay reachability.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_endpoint_reconnect_relay_reloads_auth_token() -> Result {
+        const TOKEN_A: &str = "token-a";
+        const TOKEN_B: &str = "token-b";
+
+        #[derive(Debug)]
+        struct RotatingTokenAccess {
+            allowed: Mutex<String>,
+            seen: Mutex<Vec<String>>,
+        }
+
+        impl RotatingTokenAccess {
+            fn new(token: &str) -> Arc<Self> {
+                Arc::new(Self {
+                    allowed: Mutex::new(token.to_owned()),
+                    seen: Mutex::new(Vec::new()),
+                })
+            }
+
+            fn rotate(&self, token: &str) {
+                *self.allowed.lock().expect("poisoned") = token.to_owned();
+            }
+
+            fn seen(&self) -> Vec<String> {
+                self.seen.lock().expect("poisoned").clone()
+            }
+        }
+
+        impl iroh_relay::server::AccessControl for RotatingTokenAccess {
+            async fn on_connect(&self, request: &iroh_relay::server::ClientRequest) -> Access {
+                let token = request.auth_token().unwrap_or_default();
+                self.seen.lock().expect("poisoned").push(token.clone());
+                if token == *self.allowed.lock().expect("poisoned") {
+                    Access::Allow
+                } else {
+                    Access::Deny { reason: None }
+                }
+            }
+        }
+
+        let access = RotatingTokenAccess::new(TOKEN_A);
+        let (_relay_map, relay_url, relay_server) =
+            run_relay_server_with_access(false, access.clone()).await?;
+        let map: RelayMap = RelayConfig::new(relay_url.clone(), None)
+            .with_auth_token(TOKEN_A)
+            .into();
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Custom(map))
+            .clear_ip_transports()
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .bind()
+            .await?;
+        tokio::time::timeout(Duration::from_secs(5), endpoint.online())
+            .await
+            .std_context("waiting for token-a relay connection")?;
+        let endpoint_id = endpoint.id();
+        let mut home_relays = endpoint.home_relay_status().stream();
+
+        access.rotate(TOKEN_B);
+        let next_config =
+            Arc::new(RelayConfig::new(relay_url.clone(), None).with_auth_token(TOKEN_B));
+        endpoint
+            .reconnect_relay(relay_url.clone(), next_config)
+            .await?;
+        assert_eq!(endpoint.id(), endpoint_id);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut observed_reconnect = false;
+            while let Some(statuses) = home_relays.next().await {
+                if statuses.iter().any(|status| !status.is_connected()) {
+                    observed_reconnect = true;
+                }
+                if observed_reconnect && statuses.iter().any(|status| status.is_connected()) {
+                    return;
+                }
+            }
+            panic!("home relay stream ended before reconnect");
+        })
+        .await
+        .std_context("waiting for token-b relay connection")?;
+        assert_eq!(access.seen().last().map(String::as_str), Some(TOKEN_B));
+
+        relay_server
+            .relay_service()
+            .expect("relay configured")
+            .clients()
+            .disconnect(endpoint_id, None);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut observed_disconnect = false;
+            while let Some(statuses) = home_relays.next().await {
+                if statuses.iter().any(|status| !status.is_connected()) {
+                    observed_disconnect = true;
+                }
+                if observed_disconnect && statuses.iter().any(|status| status.is_connected()) {
+                    return;
+                }
+            }
+            panic!("home relay stream ended before retry");
+        })
+        .await
+        .std_context("waiting for token-b retry")?;
+        let seen = access.seen();
+        let first_b = seen
+            .iter()
+            .position(|token| token == TOKEN_B)
+            .expect("token-b was not presented");
+        assert!(seen[first_b..].iter().all(|token| token == TOKEN_B));
+
+        let peer_map: RelayMap = RelayConfig::new(relay_url, None)
+            .with_auth_token(TOKEN_B)
+            .into();
+        let peer = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Custom(peer_map))
+            .clear_ip_transports()
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .bind()
+            .await?;
+        tokio::time::timeout(Duration::from_secs(5), peer.online())
+            .await
+            .std_context("waiting for peer relay connection")?;
+        let accept_endpoint = endpoint.clone();
+        let accept = tokio::spawn(async move {
+            let incoming = accept_endpoint.accept().await.expect("endpoint closed");
+            incoming.await.expect("incoming handshake failed")
+        });
+        let mut addr = endpoint.addr();
+        addr.addrs.retain(|addr| addr.is_relay());
+        let connection =
+            tokio::time::timeout(Duration::from_secs(5), peer.connect(addr, TEST_ALPN))
+                .await
+                .std_context("waiting for inbound relay connection")??;
+        let accepted = accept.await.std_context("accept task failed")?;
+        connection.close(0u32.into(), b"done");
+        accepted.close(0u32.into(), b"done");
+        peer.close().await;
+        endpoint.close().await;
+
         Ok(())
     }
 

@@ -1255,6 +1255,23 @@ impl EndpointInner {
         res
     }
 
+    pub(crate) async fn reconnect_relay(
+        &self,
+        relay: RelayUrl,
+        config: Arc<RelayConfig>,
+    ) -> io::Result<Option<Arc<RelayConfig>>> {
+        let previous = self.relay_map.insert(relay.clone(), config);
+        let (response, result) = oneshot::channel();
+        self.actor_sender
+            .send(ActorMessage::ReconnectRelay(relay, response))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "endpoint actor stopped"))?;
+        result
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "endpoint actor stopped"))??;
+        Ok(previous)
+    }
+
     /// Adds an external address to advertise to peers.
     pub(crate) async fn add_external_addr(&self, addr: SocketAddr) {
         self.sock
@@ -1379,6 +1396,8 @@ impl EndpointInner {
 enum ActorMessage {
     NetworkChange,
     RelayMapChange,
+    #[debug("ReconnectRelay(..)")]
+    ReconnectRelay(RelayUrl, oneshot::Sender<io::Result<()>>),
     #[debug("ResolveRemote(..)")]
     ResolveRemote(
         EndpointAddr,
@@ -1780,6 +1799,13 @@ impl Actor {
             }
             ActorMessage::RelayMapChange => {
                 self.handle_relay_map_change();
+            }
+            ActorMessage::ReconnectRelay(url, response) => {
+                let result = self.transports_network_change.reconnect_relay(&url).await;
+                if result.is_ok() {
+                    self.handle_relay_map_change();
+                }
+                response.send(result).ok();
             }
             ActorMessage::ResolveRemote(addr, tx) => {
                 self.remote_map.resolve_remote(addr, tx).await;

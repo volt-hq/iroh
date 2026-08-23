@@ -12,7 +12,7 @@ use n0_future::{
     task::{self, AbortOnDropHandle},
 };
 use n0_watcher::Watcher as _;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::{CancellationToken, PollSender};
 use tracing::{Instrument, error, info_span, warn};
 
@@ -226,6 +226,17 @@ impl RelayNetworkChangeSender {
     /// Triggers an immediate health check on relay connections after a network change.
     pub(super) fn check_connection_after_network_change(&self) {
         self.send_relay_actor(RelayActorMessage::CheckConnectionAfterNetworkChange);
+    }
+
+    pub(super) async fn reconnect_relay(&self, url: RelayUrl) -> io::Result<()> {
+        let (response, result) = oneshot::channel();
+        self.sender
+            .send(RelayActorMessage::ReconnectRelay { url, response })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "relay actor stopped"))?;
+        result
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "relay actor stopped"))
     }
 
     pub(super) fn rebind(&self) -> io::Result<()> {
